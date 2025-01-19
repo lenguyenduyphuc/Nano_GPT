@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch  
 import torch.nn as nn
 from torch.nn import functional as F
+import tiktoken
 
 #-------------------------------------------
 
@@ -32,9 +33,9 @@ class CausalSelfAttention(nn.Module):
 
     qkv = self.c_attn(x)
     q, k, v = qkv.split(self.n_embd, dim=2)
-    k = k.view(B,T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
-    q = k.view(B,T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
-    v = k.view(B,T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
     #attention (materialize the large (T,T) matrix for all the queries and keys)
     att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
     att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
@@ -67,8 +68,8 @@ class Block(nn.Module):
     self.mlp = MLP(config)
 
   def forward(self, x):
-    x = x + self.attn(self.ln1(x))
-    x = x + self.mlp(self.ln2(x))
+    x = x + self.attn(self.ln_1(x))
+    x = x + self.mlp(self.ln_2(x))
     return x
   
 @dataclass
@@ -94,6 +95,24 @@ class GPT(nn.Module):
 
     # weight sharing scheme
     self.transformer.wte.weight = self.lm_head.weight
+  
+  def forward(self, idx):
+    # idx is of shape (B, T)
+    B, T = idx.size()
+    assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+    # forward the token and posisition embeddings
+    pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+    pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+    tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+    x = tok_emb + pos_emb
+    # forward the blocks of the transformer
+    for block in self.transformer.h:
+      x = block(x)
+    # forward the final layernorm and the classifier
+    x = self.transformer.ln_f(x)
+    logits = self.lm_head(x) # (B, T, vocab_size)
+    return logits
+    
 
   #loading the weight
   @classmethod
@@ -145,5 +164,44 @@ class GPT(nn.Module):
     return model
 
 #------------------
+num_return_sequences = 5
+max_length = 30
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = GPT.from_pretrained('gpt2')
-print('didnt crash')
+model.eval()
+model.to(device)
+
+#prefix token
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I am a LLM")
+tokens = torch.tensor(tokens, dtype = torch.long) # (8, )
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device) 
+
+#generates! x is (B, T) = (5,8)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while (x.size(1) < max_length):
+  #forward the model to get the grad:
+  with torch.no_grad():
+    logits = model(x) #(B, T, vocab_size)
+    #take the logits at the last pos
+    logits = logits[:, -1, :]
+    #get the probs
+    probs = F.softmax(logits, dim=-1)
+    #do top_k sampling of 50 best probs
+    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    #select a token
+    ix = torch.multinomial(topk_probs, 1)
+    #gather the correspondence indices
+    xcol = torch.gather(topk_indices, -1, ix)
+    #append to the sequence
+    x = torch.cat((x, xcol), dim=1)
+
+#print the text
+for i in range(num_return_sequences):
+  tokens = x[i, :max_length].tolist()
+  decoded = enc.decode(tokens)
+  print('>', decoded)
+
