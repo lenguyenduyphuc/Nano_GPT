@@ -163,6 +163,7 @@ class GPT(nn.Module):
 
     return model
 
+#add some funny
 #------------------
 num_return_sequences = 5
 max_length = 30
