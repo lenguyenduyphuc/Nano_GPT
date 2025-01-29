@@ -47,7 +47,7 @@ class CausalSelfAttention(nn.Module):
         # out_projection
         y = self.c_proj(y)
         return y
-  
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -233,6 +233,7 @@ torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model) # reduce compile time
 
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -241,7 +242,8 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
