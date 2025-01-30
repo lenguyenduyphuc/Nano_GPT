@@ -199,7 +199,7 @@ class DataLoaderLite:
         with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
-        tokens =  enc.encode(text)
+        tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
@@ -211,8 +211,8 @@ class DataLoaderLite:
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position +  B*T + 1]
         x = (buf[:-1]).view(B, T)   # input
-        y = (buf[:-1]).view(B, T)   # target
-        #advancing in tensor
+        y = (buf[1:]).view(B, T)   # target
+        # advancing in tensor
         self.current_position += B * T
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
@@ -239,9 +239,26 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model) # reduce compile time
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1/ Linear warmup for steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2/ If it > lr_decay_iters, return min lr
+    if it > max_steps:
+        return min_lr
+    # 3 in betwween use cosin learning decay
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff start at 1 and come to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
 # optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-for i in range(50):
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -250,12 +267,15 @@ for i in range(50):
         logits, loss = model(x, y)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time differenes in ms
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 -t0)
-    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f} tok")
+    print(f"step {step:4d} | lr: {lr:.3e} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
