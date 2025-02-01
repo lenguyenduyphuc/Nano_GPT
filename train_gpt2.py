@@ -40,14 +40,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # attention (materialize the large (T,T) matrix for all the queries and keys)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         
+        # attention (materialize the large (T,T) matrix for all the queries and keys)
         # att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
         # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
         # att = F.softmax(att, dim=-1)
         # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # out_projection
@@ -55,6 +54,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -69,6 +69,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -111,7 +112,7 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
-            if hasattr(module, "NANOGPT_SCALE_INIT"):
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -119,8 +120,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    
-    def forward(self, idx, targets = None):
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -132,14 +132,13 @@ class GPT(nn.Module):
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
-            # forward the final layernorm and the classifier
-            x = self.transformer.ln_f(x)
-            logits = self.lm_head(x) # (B, T, vocab_size)
-            loss = None
-            if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-        
 
     # Loading the weight
     @classmethod
@@ -215,6 +214,7 @@ class GPT(nn.Module):
 
 #------------------
 import numpy as np
+
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
