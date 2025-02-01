@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
+import inspect
 
 #-------------------------------------------
 
@@ -187,6 +188,29 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 #------------------
 
@@ -230,6 +254,14 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+total_batch_size = 524288 # 2**19, 0.5M, in nums of tokens
+B = 32
+T = 1024
+assert total_batch_size % (B * T) == 0 # make sure the batch size is divisible
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculate gradient accumulation steps: {grad_accum_steps}")
+
 train_loader = DataLoaderLite(B=16, T=1024)
 
 torch.set_float32_matmul_precision('high')
@@ -257,15 +289,24 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        # we have to scale the loss to account for gradient accumulation,
+        # because the gradients just add on each successive backward().
+        # addition of gradients corresponds to a SUM in the objective, but
+        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -273,9 +314,9 @@ for step in range(max_steps):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # time differenes in ms
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 -t0)
-    print(f"step {step:4d} | lr: {lr:.3e} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
+    dt = (t1 - t0) # time differenes in s
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"step {step:4d} | lr: {lr:.3e} | loss: {loss_accum.item():.6f} | norm: {norm:.4f} | dt: {dt*1000:.2f} ms | tok/sec: {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
